@@ -1,0 +1,205 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robomaster_arm">
+  <xacro:arg name="serial_port" default="/dev/ttyACM0"/>
+  <xacro:arg name="baud_rate" default="921600"/>
+  <xacro:arg name="prefix" default=""/>
+
+  <!--
+    This is a deliberately simple 6-DOF geometry template. The cylinders are
+    placeholders so ros2_control, MoveIt, and RViz have a complete kinematic
+    tree while the real CAD and inertias are still being developed.
+
+    Important gearing note:
+    ros2_control command/state units are joint radians. The RP2350 firmware
+    currently accepts motor/joint targets in degrees and assumes the AS5600
+    reading has already been calibrated into joint degrees.
+
+    If the final arm has belt/gear reductions between a motor, encoder, and the
+    output joint, apply that relationship either:
+      1. In firmware before reporting position_deg, or
+      2. In this hardware interface before converting telemetry to ROS units.
+
+    Example external ratio:
+      joint_degrees = encoder_degrees / joint_to_encoder_ratio
+
+    A future production xacro can expose joint_to_encoder_ratio as a per-joint
+    ros2_control parameter. The parameter stubs below document where that
+    belongs.
+  -->
+
+  <material name="arm_gray">
+    <color rgba="0.55 0.58 0.62 1.0"/>
+  </material>
+  <material name="joint_blue">
+    <color rgba="0.1 0.25 0.8 1.0"/>
+  </material>
+
+  <xacro:macro name="cylinder_link" params="name length radius mass">
+    <link name="${name}">
+      <visual>
+        <origin xyz="${length / 2.0} 0 0" rpy="0 1.57079632679 0"/>
+        <geometry>
+          <cylinder length="${length}" radius="${radius}"/>
+        </geometry>
+        <material name="arm_gray"/>
+      </visual>
+      <collision>
+        <origin xyz="${length / 2.0} 0 0" rpy="0 1.57079632679 0"/>
+        <geometry>
+          <cylinder length="${length}" radius="${radius}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="${length / 2.0} 0 0" rpy="0 0 0"/>
+        <mass value="${mass}"/>
+        <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+      </inertial>
+    </link>
+  </xacro:macro>
+
+  <link name="$(arg prefix)base_link">
+    <visual>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.08" radius="0.09"/>
+      </geometry>
+      <material name="joint_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.08" radius="0.09"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.04" rpy="0 0 0"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/>
+    </inertial>
+  </link>
+
+  <xacro:cylinder_link name="$(arg prefix)link_1" length="0.22" radius="0.035" mass="0.5"/>
+  <xacro:cylinder_link name="$(arg prefix)link_2" length="0.24" radius="0.032" mass="0.45"/>
+  <xacro:cylinder_link name="$(arg prefix)link_3" length="0.20" radius="0.030" mass="0.35"/>
+  <xacro:cylinder_link name="$(arg prefix)link_4" length="0.16" radius="0.026" mass="0.25"/>
+  <xacro:cylinder_link name="$(arg prefix)link_5" length="0.12" radius="0.024" mass="0.20"/>
+  <xacro:cylinder_link name="$(arg prefix)tool0" length="0.08" radius="0.020" mass="0.15"/>
+
+  <joint name="$(arg prefix)joint_1" type="revolute">
+    <parent link="$(arg prefix)base_link"/>
+    <child link="$(arg prefix)link_1"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="20" velocity="1.5"/>
+  </joint>
+
+  <joint name="$(arg prefix)joint_2" type="revolute">
+    <parent link="$(arg prefix)link_1"/>
+    <child link="$(arg prefix)link_2"/>
+    <origin xyz="0.22 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5708" upper="1.5708" effort="20" velocity="1.5"/>
+  </joint>
+
+  <joint name="$(arg prefix)joint_3" type="revolute">
+    <parent link="$(arg prefix)link_2"/>
+    <child link="$(arg prefix)link_3"/>
+    <origin xyz="0.24 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5708" upper="1.5708" effort="15" velocity="1.5"/>
+  </joint>
+
+  <joint name="$(arg prefix)joint_4" type="revolute">
+    <parent link="$(arg prefix)link_3"/>
+    <child link="$(arg prefix)link_4"/>
+    <origin xyz="0.20 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.14159" upper="3.14159" effort="10" velocity="2.0"/>
+  </joint>
+
+  <joint name="$(arg prefix)joint_5" type="revolute">
+    <parent link="$(arg prefix)link_4"/>
+    <child link="$(arg prefix)link_5"/>
+    <origin xyz="0.16 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5708" upper="1.5708" effort="8" velocity="2.0"/>
+  </joint>
+
+  <joint name="$(arg prefix)joint_6" type="revolute">
+    <parent link="$(arg prefix)link_5"/>
+    <child link="$(arg prefix)tool0"/>
+    <origin xyz="0.12 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.14159" upper="3.14159" effort="5" velocity="2.5"/>
+  </joint>
+
+  <ros2_control name="$(arg prefix)RoboMasterArmSystem" type="system">
+    <hardware>
+      <plugin>robomaster_arm_hw/RoboMasterArmSystemHardware</plugin>
+      <param name="serial_port">$(arg serial_port)</param>
+      <param name="baud_rate">$(arg baud_rate)</param>
+      <param name="telemetry_timeout_ms">250</param>
+      <param name="max_consecutive_dropouts">25</param>
+    </hardware>
+
+    <joint name="$(arg prefix)joint_1">
+      <param name="motor_id">1</param>
+      <param name="encoder_channel">0</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="$(arg prefix)joint_2">
+      <param name="motor_id">2</param>
+      <param name="encoder_channel">1</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="$(arg prefix)joint_3">
+      <param name="motor_id">3</param>
+      <param name="encoder_channel">2</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="$(arg prefix)joint_4">
+      <param name="motor_id">4</param>
+      <param name="encoder_channel">3</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="$(arg prefix)joint_5">
+      <param name="motor_id">5</param>
+      <param name="encoder_channel">4</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="$(arg prefix)joint_6">
+      <param name="motor_id">6</param>
+      <param name="encoder_channel">5</param>
+      <param name="joint_to_encoder_ratio">1.0</param>
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+</robot>

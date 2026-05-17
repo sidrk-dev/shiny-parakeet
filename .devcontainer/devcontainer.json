@@ -1,0 +1,25 @@
+{
+  "name": "RoboMaster Arm ROS 2 Humble",
+  "dockerComposeFile": "../docker/docker-compose.yml",
+  "service": "ros2",
+  "workspaceFolder": "/workspaces/armNew",
+  "remoteUser": "ros",
+  "shutdownAction": "stopCompose",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-iot.vscode-ros",
+        "ms-azuretools.vscode-docker",
+        "twxs.cmake"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "cmake.configureOnOpen": false,
+        "C_Cpp.default.cppStandard": "c++17"
+      }
+    }
+  },
+  "postCreateCommand": "bash -lc 'source /opt/ros/humble/setup.bash && cd /workspaces/armNew/ros2_ws && rosdep install --from-paths src --ignore-src -r -y --skip-keys ament_python || true'"
+}

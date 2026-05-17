@@ -1,0 +1,6 @@
+services:
+  ros2:
+    devices:
+      - ${RP2350_SERIAL:-/dev/ttyACM0}:${RP2350_SERIAL:-/dev/ttyACM0}
+    volumes:
+      - /dev:/dev

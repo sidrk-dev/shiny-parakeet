@@ -1,0 +1,10 @@
+<library path="robomaster_arm_hw">
+  <class
+    name="robomaster_arm_hw/RoboMasterArmSystemHardware"
+    type="robomaster_arm_hw::RoboMasterArmSystemHardware"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Serial COBS hardware interface for the RP2350 RoboMaster arm firmware.
+    </description>
+  </class>
+</library>

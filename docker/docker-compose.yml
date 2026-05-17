@@ -1,0 +1,22 @@
+services:
+  ros2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: robomaster-arm-humble:latest
+    privileged: true
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ${DISPLAY:-}
+      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      RP2350_SERIAL: ${RP2350_SERIAL:-/dev/ttyACM0}
+    volumes:
+      - ..:/workspaces/armNew:cached
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    working_dir: /workspaces/armNew
+    command: /bin/bash

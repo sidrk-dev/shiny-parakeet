@@ -1,19 +1,21 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <Wire.h>
-#include <ctype.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define UDON_CANBUS_SPI_PICO_POLLING 1
 #include <Udon.hpp>
 #include "AbsoluteEncoder.hpp"
 #include "MotorController.hpp"
+#include "RoboMasterArmProtocol.hpp"
 
-static constexpr uint8_t kMotorCount = 8;
+namespace Protocol = RoboMasterArmProtocol;
+
+static constexpr uint8_t kMotorCount = Protocol::kMaxMotors;
 static constexpr unsigned long kControlIntervalUs = 1000;
-static uint32_t kTelemetryIntervalMs = 200;
+static constexpr uint32_t kSerialBaud = 921600;
+static constexpr uint32_t kSerialWatchdogMs = 100;
 
 // Seeed XIAO RP2350 + MCP2515 CAN pins. These match the working singleM3508 wiring.
 static constexpr uint8_t kCanCsPin = D3;
@@ -57,8 +59,6 @@ static Udon::CanBusSpi bus{makeCanConfig()};
 static AbsoluteEncoderMux encoderMux{Wire1, kI2cSdaPin, kI2cSclPin, kI2cClockHz};
 static Udon::LoopCycleController loopCtrl{kControlIntervalUs};
 
-// One CAN bus can host up to 8 RoboMaster ESCs. Motor 1 is C620/M3508, motor 2
-// is C610/M2006, and the remaining slots are ready for future joints.
 static Udon::RoboMasterC620 m1{bus, 1};
 static Udon::RoboMasterC610 m2{bus, 2};
 static Udon::RoboMasterC620 m3{bus, 3}, m4{bus, 4}, m5{bus, 5}, m6{bus, 6}, m7{bus, 7}, m8{bus, 8};
@@ -94,106 +94,107 @@ struct EncoderState {
     uint32_t lastSampleMs = 0;
 };
 
-struct EncoderCalibrationStorage {
+struct PersistentConfig {
     uint32_t magic;
     uint16_t version;
     uint16_t sizeBytes;
     uint8_t encoderConfigured[kMotorCount];
     uint8_t muxChannel[kMotorCount];
+    uint8_t motorType[kMotorCount]; // 1=M3508/C620, 2=M2006/C610
+    uint8_t reserved[kMotorCount];
     float zeroOffsetDeg[kMotorCount];
     float positionPidP[kMotorCount];
     float positionPidI[kMotorCount];
     float positionPidD[kMotorCount];
+    float velocityLimitRpm[kMotorCount];
 };
 
-static constexpr uint32_t kEncoderCalMagic = 0x41534346UL; // "ASCF"
-static constexpr uint16_t kEncoderCalVersion = 2;
+static constexpr uint32_t kConfigMagic = 0x524D4152UL; // "RMAR"
+static constexpr uint16_t kConfigVersion = 3;
 static EncoderState encoders[kMotorCount];
-static EncoderCalibrationStorage encoderCal;
+static PersistentConfig persistentConfig;
 static uint8_t nextEncoderToPoll = 0;
 
-static bool teleEnabled = true;
-static bool humanMode = true;
-static char cmdBuf[96];
-static size_t cmdLen = 0;
-static uint32_t lastTeleMs = 0;
+static uint8_t rxEncoded[Protocol::kMaxEncodedBytes];
+static uint8_t rxDecoded[Protocol::kMaxPacketBytes];
+static uint8_t txEncoded[Protocol::kMaxEncodedBytes];
+static size_t rxEncodedLength = 0;
+static uint32_t txSequence = 1;
+static uint32_t lastValidCommandMs = 0;
+static bool watchdogTripped = true;
 
-static bool parseD(const char* token, double& value) {
-    if (!token) return false;
-    char* end = nullptr;
-    value = strtod(token, &end);
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
-    return *end == '\0';
-}
-
-static void lowerToken(char* token) {
-    for (char* p = token; *p; ++p) {
-        *p = static_cast<char>(tolower(*p));
+static void stopAllMotors() {
+    for (uint8_t i = 0; i < kMotorCount; ++i) {
+        motors[i]->stop();
     }
 }
 
 static void setDefaultPersistentConfig() {
-    encoderCal.magic = kEncoderCalMagic;
-    encoderCal.version = kEncoderCalVersion;
-    encoderCal.sizeBytes = sizeof(EncoderCalibrationStorage);
+    persistentConfig.magic = kConfigMagic;
+    persistentConfig.version = kConfigVersion;
+    persistentConfig.sizeBytes = sizeof(PersistentConfig);
     for (uint8_t i = 0; i < kMotorCount; ++i) {
-        encoderCal.encoderConfigured[i] = (i == 0) ? 1 : 0;
-        encoderCal.muxChannel[i] = i;
-        encoderCal.zeroOffsetDeg[i] = 0.0f;
-        encoderCal.positionPidP[i] = static_cast<float>(kCfg.positionGains.p);
-        encoderCal.positionPidI[i] = static_cast<float>(kCfg.positionGains.i);
-        encoderCal.positionPidD[i] = static_cast<float>(kCfg.positionGains.d);
+        persistentConfig.encoderConfigured[i] = (i == 0) ? 1 : 0;
+        persistentConfig.muxChannel[i] = i;
+        persistentConfig.motorType[i] = (i == 1) ? 2 : 1;
+        persistentConfig.reserved[i] = 0;
+        persistentConfig.zeroOffsetDeg[i] = 0.0f;
+        persistentConfig.positionPidP[i] = static_cast<float>(kCfg.positionGains.p);
+        persistentConfig.positionPidI[i] = static_cast<float>(kCfg.positionGains.i);
+        persistentConfig.positionPidD[i] = static_cast<float>(kCfg.positionGains.d);
+        persistentConfig.velocityLimitRpm[i] = static_cast<float>(kCfg.maxPositionVelocityRpm);
     }
-    encoderCal.muxChannel[0] = 0;
+    persistentConfig.muxChannel[0] = 0;
 }
 
 static void savePersistentConfig() {
-    encoderCal.magic = kEncoderCalMagic;
-    encoderCal.version = kEncoderCalVersion;
-    encoderCal.sizeBytes = sizeof(EncoderCalibrationStorage);
+    persistentConfig.magic = kConfigMagic;
+    persistentConfig.version = kConfigVersion;
+    persistentConfig.sizeBytes = sizeof(PersistentConfig);
     for (uint8_t i = 0; i < kMotorCount; ++i) {
         const MotorController::PidGains gains = motors[i]->getPositionGains();
-        encoderCal.encoderConfigured[i] = encoders[i].configured ? 1 : 0;
-        encoderCal.muxChannel[i] = encoders[i].muxChannel;
-        encoderCal.zeroOffsetDeg[i] = static_cast<float>(encoders[i].zeroOffsetDeg);
-        encoderCal.positionPidP[i] = static_cast<float>(gains.p);
-        encoderCal.positionPidI[i] = static_cast<float>(gains.i);
-        encoderCal.positionPidD[i] = static_cast<float>(gains.d);
+        persistentConfig.encoderConfigured[i] = encoders[i].configured ? 1 : 0;
+        persistentConfig.muxChannel[i] = encoders[i].muxChannel;
+        persistentConfig.zeroOffsetDeg[i] = static_cast<float>(encoders[i].zeroOffsetDeg);
+        persistentConfig.positionPidP[i] = static_cast<float>(gains.p);
+        persistentConfig.positionPidI[i] = static_cast<float>(gains.i);
+        persistentConfig.positionPidD[i] = static_cast<float>(gains.d);
+        persistentConfig.velocityLimitRpm[i] = static_cast<float>(motors[i]->getLimitV());
     }
-    EEPROM.put(0, encoderCal);
+    EEPROM.put(0, persistentConfig);
     EEPROM.commit();
 }
 
 static void applyPersistentConfig() {
     for (uint8_t i = 0; i < kMotorCount; ++i) {
-        encoders[i].zeroOffsetDeg = AbsoluteEncoderMux::normalize0To360(encoderCal.zeroOffsetDeg[i]);
-        encoders[i].muxChannel = encoderCal.muxChannel[i] <= 7 ? encoderCal.muxChannel[i] : i;
-        encoders[i].configured = encoderCal.encoderConfigured[i] != 0 && encoders[i].muxChannel <= 7;
+        encoders[i].zeroOffsetDeg = AbsoluteEncoderMux::normalize0To360(persistentConfig.zeroOffsetDeg[i]);
+        encoders[i].muxChannel = persistentConfig.muxChannel[i] <= 7 ? persistentConfig.muxChannel[i] : i;
+        encoders[i].configured = persistentConfig.encoderConfigured[i] != 0 && encoders[i].muxChannel <= 7;
         encoders[i].valid = false;
         encoders[i].consecutiveFailures = 0;
         encoders[i].lastError = 0;
 
+        motors[i]->setMotorType(persistentConfig.motorType[i] == 1);
+        motors[i]->setLimitV(persistentConfig.velocityLimitRpm[i]);
         motors[i]->setPositionGains(
-            encoderCal.positionPidP[i],
-            encoderCal.positionPidI[i],
-            encoderCal.positionPidD[i]
+            persistentConfig.positionPidP[i],
+            persistentConfig.positionPidI[i],
+            persistentConfig.positionPidD[i]
         );
         motors[i]->enableAbsoluteFeedback(encoders[i].configured);
     }
 }
 
 static void loadPersistentConfig() {
-    EEPROM.begin(sizeof(EncoderCalibrationStorage));
-    EEPROM.get(0, encoderCal);
-
-    if (encoderCal.magic != kEncoderCalMagic
-        || encoderCal.version != kEncoderCalVersion
-        || encoderCal.sizeBytes != sizeof(EncoderCalibrationStorage)) {
+    EEPROM.begin(sizeof(PersistentConfig));
+    EEPROM.get(0, persistentConfig);
+    if (persistentConfig.magic != kConfigMagic
+        || persistentConfig.version != kConfigVersion
+        || persistentConfig.sizeBytes != sizeof(PersistentConfig)) {
         setDefaultPersistentConfig();
-        EEPROM.put(0, encoderCal);
+        EEPROM.put(0, persistentConfig);
         EEPROM.commit();
     }
-
     applyPersistentConfig();
 }
 
@@ -209,7 +210,6 @@ static bool configureEncoder(uint8_t motorId, uint8_t muxChannel) {
     encoder.consecutiveFailures = 0;
     encoder.lastError = 0;
     motors[motorId - 1]->enableAbsoluteFeedback(true);
-    savePersistentConfig();
     return true;
 }
 
@@ -222,7 +222,6 @@ static bool disableEncoder(uint8_t motorId) {
     encoder.configured = false;
     encoder.valid = false;
     motors[motorId - 1]->enableAbsoluteFeedback(false);
-    savePersistentConfig();
     return true;
 }
 
@@ -269,6 +268,14 @@ static void pollOneConfiguredEncoder() {
     }
 }
 
+static void snapshotAllConfiguredEncoders() {
+    for (uint8_t i = 0; i < kMotorCount; ++i) {
+        if (encoders[i].configured) {
+            pollEncoder(i);
+        }
+    }
+}
+
 static bool setEncoderZero(uint8_t motorId) {
     if (motorId < 1 || motorId > kMotorCount) {
         return false;
@@ -283,260 +290,258 @@ static bool setEncoderZero(uint8_t motorId) {
     encoder.positionDeg = 0.0;
     motors[motorId - 1]->setAbsolutePositionFeedbackDeg(0.0, true, millis());
     motors[motorId - 1]->rebasePositionTargetToCurrent();
-    savePersistentConfig();
     return true;
 }
 
-static const char* modeName(MotorController::Mode mode) {
+static void sendEncodedPacket(const void* packet, size_t packetSize) {
+    const size_t encodedLength = Protocol::cobsEncode(
+        reinterpret_cast<const uint8_t*>(packet),
+        packetSize,
+        txEncoded,
+        sizeof(txEncoded)
+    );
+    if (encodedLength == 0) {
+        return;
+    }
+    Serial.write(txEncoded, encodedLength);
+    Serial.write(static_cast<uint8_t>(0));
+}
+
+static void sendTelemetryPacket(Protocol::TelemetryPacket& packet, uint32_t sequence) {
+    Protocol::finalizePacket(packet, Protocol::PacketType::Telemetry, sequence);
+    sendEncodedPacket(&packet, sizeof(packet));
+}
+
+static void sendConfigAckPacket(Protocol::ConfigAckPacket& packet, uint32_t sequence) {
+    Protocol::finalizePacket(packet, Protocol::PacketType::ConfigAck, sequence);
+    sendEncodedPacket(&packet, sizeof(packet));
+}
+
+static uint8_t protocolModeFromController(MotorController::Mode mode) {
     switch (mode) {
-        case MotorController::Mode::Velocity: return "SPD";
-        case MotorController::Mode::Position: return "POS";
-        case MotorController::Mode::Current: return "CUR";
+        case MotorController::Mode::Velocity: return static_cast<uint8_t>(Protocol::MotorMode::Velocity);
+        case MotorController::Mode::Position: return static_cast<uint8_t>(Protocol::MotorMode::Position);
+        case MotorController::Mode::Current: return static_cast<uint8_t>(Protocol::MotorMode::Current);
         case MotorController::Mode::Stopped:
-        default: return "STOP";
+        default: return static_cast<uint8_t>(Protocol::MotorMode::Stop);
     }
 }
 
-static void printHelp() {
-    Serial.println("# Commands:");
-    Serial.println("# v id rpm          -> velocity target in output rpm");
-    Serial.println("# p id deg          -> position target in degrees");
-    Serial.println("# i id mA           -> direct current command for low-level tests");
-    Serial.println("# l id rpm          -> position loop velocity limit");
-    Serial.println("# k id 1|2          -> motor gearing/type: 1=M3508/C620, 2=M2006/C610");
-    Serial.println("# e id chan         -> attach AS5600 on PCA9548A mux channel");
-    Serial.println("# ed id             -> disable external encoder feedback");
-    Serial.println("# z id              -> save current AS5600 angle as zero degrees");
-    Serial.println("# pid id p i d      -> tune position PID gains live, in degree units");
-    Serial.println("# t                 -> toggle telemetry");
-    Serial.println("# m                 -> toggle human/csv telemetry");
-    Serial.println("# s                 -> stop all motors");
-}
+static void sendTelemetry(uint32_t requestSequence) {
+    snapshotAllConfiguredEncoders();
 
-static void doCmd(char* line) {
-    Serial.print("# RECV: ["); Serial.print(line); Serial.println("]");
-    char* tok = strtok(line, " \t");
-    if (!tok) return;
-    lowerToken(tok);
-
-    if (strcmp(tok, "h") == 0 || strcmp(tok, "?") == 0) {
-        printHelp();
-        return;
-    }
-
-    if (strcmp(tok, "t") == 0) {
-        teleEnabled = !teleEnabled;
-        Serial.println(teleEnabled ? "# OK TELE ON" : "# OK TELE OFF");
-        return;
-    }
-
-    if (strcmp(tok, "m") == 0) {
-        humanMode = !humanMode;
-        Serial.println(humanMode ? "# OK HUMAN TELE" : "# OK CSV TELE");
-        return;
-    }
-
-    if (strcmp(tok, "s") == 0) {
-        for (uint8_t i = 0; i < kMotorCount; ++i) motors[i]->stop();
-        Serial.println("# OK STOP ALL");
-        return;
-    }
-
-    if (strcmp(tok, "pid") == 0) {
-        char* idT = strtok(nullptr, " \t");
-        char* pT = strtok(nullptr, " \t");
-        char* iT = strtok(nullptr, " \t");
-        char* dT = strtok(nullptr, " \t");
-        if (!idT || !pT || !iT || !dT) {
-            Serial.println("# ERR USAGE pid id p i d");
-            return;
-        }
-
-        const int id = atoi(idT);
-        double p = 0.0, i = 0.0, d = 0.0;
-        if (id < 1 || id > kMotorCount || !parseD(pT, p) || !parseD(iT, i) || !parseD(dT, d)) {
-            Serial.println("# ERR BAD PID ARGS");
-            return;
-        }
-
-        motors[id - 1]->setPositionGains(p, i, d);
-        savePersistentConfig();
-        Serial.print("# OK ID "); Serial.print(id);
-        Serial.print(" PID="); Serial.print(p, 6);
-        Serial.print(","); Serial.print(i, 6);
-        Serial.print(","); Serial.println(d, 6);
-        return;
-    }
-
-    char* idT = strtok(nullptr, " \t");
-    if (!idT) {
-        Serial.println("# ERR MISSING ID");
-        return;
-    }
-
-    const int id = atoi(idT);
-    if (id < 1 || id > kMotorCount) {
-        Serial.println("# ERR BAD ID");
-        return;
-    }
-
-    if (strcmp(tok, "z") == 0) {
-        if (setEncoderZero(static_cast<uint8_t>(id))) {
-            Serial.print("# OK ID "); Serial.print(id); Serial.println(" ZERO SAVED");
-        } else {
-            Serial.print("# ERR ID "); Serial.print(id); Serial.println(" ENCODER NOT VALID");
-        }
-        return;
-    }
-
-    if (strcmp(tok, "ed") == 0) {
-        disableEncoder(static_cast<uint8_t>(id));
-        Serial.print("# OK ID "); Serial.print(id); Serial.println(" EXT_ENC OFF");
-        return;
-    }
-
-    char* valT = strtok(nullptr, " \t");
-    if (!valT) {
-        Serial.println("# ERR MISSING VALUE");
-        return;
-    }
-
-    double val = 0.0;
-    if (!parseD(valT, val)) {
-        Serial.println("# ERR BAD VALUE");
-        return;
-    }
-
-    MotorController* motor = motors[id - 1];
-    if (strcmp(tok, "v") == 0) {
-        motor->setTargetVelocity(val);
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" V="); Serial.println(val);
-    } else if (strcmp(tok, "p") == 0) {
-        motor->setTargetPositionDeg(val);
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" P_DEG="); Serial.println(val);
-    } else if (strcmp(tok, "i") == 0) {
-        motor->setTargetCurrent(val);
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" I="); Serial.println(val);
-    } else if (strcmp(tok, "l") == 0) {
-        motor->setLimitV(val);
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" L="); Serial.println(val);
-    } else if (strcmp(tok, "k") == 0) {
-        motor->setMotorType(static_cast<int>(val) == 1);
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" T=");
-        Serial.println(static_cast<int>(val) == 1 ? "3508" : "2006");
-    } else if (strcmp(tok, "e") == 0) {
-        const int channel = static_cast<int>(val);
-        if (channel < 0 || channel > 7 || !configureEncoder(static_cast<uint8_t>(id), static_cast<uint8_t>(channel))) {
-            Serial.println("# ERR BAD ENCODER CHANNEL");
-            return;
-        }
-        Serial.print("# OK ID "); Serial.print(id); Serial.print(" EXT_ENC CHAN "); Serial.println(channel);
-    } else {
-        Serial.println("# ERR UNKNOWN OP");
-    }
-}
-
-static void checkSerial() {
-    while (Serial.available()) {
-        const char c = static_cast<char>(Serial.read());
-        if (c == '\n' || c == '\r') {
-            if (cmdLen > 0) {
-                cmdBuf[cmdLen] = '\0';
-                doCmd(cmdBuf);
-                cmdLen = 0;
-            }
-        } else if (cmdLen < sizeof(cmdBuf) - 1) {
-            cmdBuf[cmdLen++] = c;
-        }
-    }
-}
-
-static void pad(double v, int width, int precision) {
-    String s = String(v, precision);
-    Serial.print(s);
-    for (int i = 0; i < width - static_cast<int>(s.length()); ++i) Serial.print(' ');
-}
-
-static void printTelemetry(uint32_t now) {
-    if (humanMode) {
-        Serial.println("\nID | TYPE | MODE | TGT_V | ACT_V | LIM_V | TGT_D | POS_D | TMP | CURR | FB      | ENC");
-        for (uint8_t i = 0; i < kMotorCount; ++i) {
-            if (!motors[i]->isActive() && !encoders[i].configured) {
-                continue;
-            }
-
-            Serial.print(i + 1); Serial.print("  | ");
-            Serial.print(strcmp(motors[i]->getMotorType(), "M3508") == 0 ? "3508" : "2006"); Serial.print(" | ");
-            Serial.print(modeName(motors[i]->getMode())); Serial.print(" | ");
-            pad(motors[i]->getTargetV(), 5, 1); Serial.print(" | ");
-            pad(motors[i]->getOutputVelocity(), 5, 1); Serial.print(" | ");
-            pad(motors[i]->getLimitV(), 5, 0); Serial.print(" | ");
-            pad(motors[i]->getTargetPDeg(), 5, 2); Serial.print(" | ");
-            pad(motors[i]->getOutputPositionDeg(), 5, 2); Serial.print(" | ");
-            Serial.print(motors[i]->getTemp()); Serial.print("C | ");
-            pad(motors[i]->getCurr(), 4, 0); Serial.print(" | ");
-            Serial.print(motors[i]->isUsingExternal() ? "AS5600 " : "CAN_ENC"); Serial.print(" | ");
-            if (encoders[i].configured) {
-                Serial.print(encoders[i].valid ? "OK ch" : "BAD ch");
-                Serial.print(encoders[i].muxChannel);
-                if (!encoders[i].valid) {
-                    Serial.print(" err");
-                    Serial.print(encoders[i].lastError);
-                }
-            } else {
-                Serial.print("--");
-            }
-            Serial.println();
-        }
-        return;
-    }
+    Protocol::TelemetryPacket packet;
+    memset(&packet, 0, sizeof(packet));
+    const uint32_t now = millis();
+    packet.mcu_time_ms = now;
+    packet.last_command_age_ms = lastValidCommandMs == 0 ? 0xFFFFFFFFUL : now - lastValidCommandMs;
+    packet.motor_count = kMotorCount;
+    packet.watchdog_tripped = watchdogTripped ? 1 : 0;
 
     for (uint8_t i = 0; i < kMotorCount; ++i) {
-        if (!motors[i]->isActive() && !encoders[i].configured) {
+        packet.active[i] = motors[i]->isActive() ? 1 : 0;
+        packet.mode[i] = protocolModeFromController(motors[i]->getMode());
+        packet.encoder_configured[i] = encoders[i].configured ? 1 : 0;
+        packet.encoder_valid[i] = encoders[i].valid ? 1 : 0;
+        packet.encoder_channel[i] = encoders[i].configured ? encoders[i].muxChannel : 255;
+        packet.i2c_error[i] = encoders[i].lastError;
+        packet.position_deg[i] = static_cast<float>(motors[i]->getPositionFeedbackDeg());
+        packet.velocity_rpm[i] = static_cast<float>(motors[i]->getOutputVelocity());
+        packet.current_ma[i] = static_cast<float>(motors[i]->getCurr());
+        packet.temperature_c[i] = static_cast<float>(motors[i]->getTemp());
+    }
+
+    sendTelemetryPacket(packet, requestSequence == 0 ? txSequence++ : requestSequence);
+}
+
+static void sendConfigAck(Protocol::ConfigCommand command, uint8_t motorId, Protocol::ConfigStatus status, uint32_t requestSequence) {
+    Protocol::ConfigAckPacket packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.command = static_cast<uint8_t>(command);
+    packet.motor_id = motorId;
+    packet.status = static_cast<uint8_t>(status);
+    sendConfigAckPacket(packet, requestSequence == 0 ? txSequence++ : requestSequence);
+}
+
+static void applyCommandPacket(const Protocol::CommandPacket& packet) {
+    const uint8_t count = packet.motor_count <= kMotorCount ? packet.motor_count : kMotorCount;
+    for (uint8_t i = 0; i < kMotorCount; ++i) {
+        const Protocol::MotorMode mode = i < count
+            ? static_cast<Protocol::MotorMode>(packet.mode[i])
+            : Protocol::MotorMode::Stop;
+
+        switch (mode) {
+            case Protocol::MotorMode::Position:
+                motors[i]->setTargetPositionDeg(packet.target_position_deg[i]);
+                break;
+            case Protocol::MotorMode::Velocity:
+                motors[i]->setTargetVelocity(packet.target_velocity_rpm[i]);
+                break;
+            case Protocol::MotorMode::Current:
+                motors[i]->setTargetCurrent(packet.target_current_ma[i]);
+                break;
+            case Protocol::MotorMode::Disabled:
+            case Protocol::MotorMode::Stop:
+            default:
+                motors[i]->stop();
+                break;
+        }
+    }
+
+    lastValidCommandMs = millis();
+    watchdogTripped = false;
+}
+
+static void applyConfigPacket(const Protocol::ConfigPacket& packet) {
+    const Protocol::ConfigCommand command = static_cast<Protocol::ConfigCommand>(packet.command);
+    const uint8_t motorId = packet.motor_id;
+    if (motorId < 1 || motorId > kMotorCount) {
+        sendConfigAck(command, motorId, Protocol::ConfigStatus::BadMotorId, packet.header.sequence);
+        return;
+    }
+
+    Protocol::ConfigStatus status = Protocol::ConfigStatus::Ok;
+    switch (command) {
+        case Protocol::ConfigCommand::EnableEncoder:
+            if (packet.encoder_channel > 7 || !configureEncoder(motorId, packet.encoder_channel)) {
+                status = Protocol::ConfigStatus::BadChannel;
+            }
+            break;
+        case Protocol::ConfigCommand::DisableEncoder:
+            disableEncoder(motorId);
+            break;
+        case Protocol::ConfigCommand::ZeroCurrentPosition:
+            if (!setEncoderZero(motorId)) {
+                status = Protocol::ConfigStatus::EncoderInvalid;
+            }
+            break;
+        case Protocol::ConfigCommand::SetPositionPid:
+            motors[motorId - 1]->setPositionGains(packet.position_pid_p, packet.position_pid_i, packet.position_pid_d);
+            break;
+        case Protocol::ConfigCommand::SetMotorType:
+            persistentConfig.motorType[motorId - 1] = packet.motor_type == 2 ? 2 : 1;
+            motors[motorId - 1]->setMotorType(persistentConfig.motorType[motorId - 1] == 1);
+            break;
+        case Protocol::ConfigCommand::SetVelocityLimit:
+            motors[motorId - 1]->setLimitV(packet.velocity_limit_rpm);
+            break;
+        case Protocol::ConfigCommand::SaveConfig:
+            break;
+        default:
+            status = Protocol::ConfigStatus::BadCommand;
+            break;
+    }
+
+    if (status == Protocol::ConfigStatus::Ok) {
+        savePersistentConfig();
+    }
+    sendConfigAck(command, motorId, status, packet.header.sequence);
+}
+
+static void handleDecodedPacket(const uint8_t* data, size_t length) {
+    if (length < sizeof(Protocol::PacketHeader)) {
+        return;
+    }
+
+    const Protocol::PacketHeader* header = reinterpret_cast<const Protocol::PacketHeader*>(data);
+    const Protocol::PacketType type = static_cast<Protocol::PacketType>(header->type);
+    if (header->version != Protocol::kProtocolVersion || Protocol::expectedPacketSize(type) != length) {
+        return;
+    }
+
+    switch (type) {
+        case Protocol::PacketType::Command: {
+            Protocol::CommandPacket packet;
+            memcpy(&packet, data, sizeof(packet));
+            if (Protocol::validatePacket(packet, Protocol::PacketType::Command)) {
+                applyCommandPacket(packet);
+            }
+            break;
+        }
+        case Protocol::PacketType::Config: {
+            Protocol::ConfigPacket packet;
+            memcpy(&packet, data, sizeof(packet));
+            if (Protocol::validatePacket(packet, Protocol::PacketType::Config)) {
+                applyConfigPacket(packet);
+            }
+            break;
+        }
+        case Protocol::PacketType::TelemetryRequest: {
+            Protocol::TelemetryRequestPacket packet;
+            memcpy(&packet, data, sizeof(packet));
+            if (Protocol::validatePacket(packet, Protocol::PacketType::TelemetryRequest)) {
+                sendTelemetry(packet.header.sequence);
+            }
+            break;
+        }
+        case Protocol::PacketType::Halt:
+            stopAllMotors();
+            watchdogTripped = true;
+            break;
+        default:
+            break;
+    }
+}
+
+static void processSerialProtocol() {
+    while (Serial.available() > 0) {
+        const int next = Serial.read();
+        if (next < 0) {
+            return;
+        }
+
+        const uint8_t byte = static_cast<uint8_t>(next);
+        if (byte == 0) {
+            if (rxEncodedLength > 0) {
+                const size_t decodedLength = Protocol::cobsDecode(
+                    rxEncoded,
+                    rxEncodedLength,
+                    rxDecoded,
+                    sizeof(rxDecoded)
+                );
+                if (decodedLength > 0) {
+                    handleDecodedPacket(rxDecoded, decodedLength);
+                }
+                rxEncodedLength = 0;
+            }
             continue;
         }
 
-        Serial.print(now); Serial.print(',');
-        Serial.print(i + 1); Serial.print(',');
-        Serial.print(motors[i]->getPositionFeedbackDeg(), 6); Serial.print(',');
-        Serial.print(motors[i]->getOutputVelocity(), 3); Serial.print(',');
-        Serial.print(motors[i]->getTemp()); Serial.print(',');
-        Serial.print(motors[i]->getCurr()); Serial.print(',');
-        Serial.print(motors[i]->isUsingExternal() ? "AS5600" : "CAN_ENC"); Serial.print(',');
-        Serial.print(encoders[i].configured ? encoders[i].muxChannel : 255); Serial.print(',');
-        Serial.print(encoders[i].valid ? 1 : 0); Serial.print(',');
-        Serial.println(encoders[i].lastError);
+        if (rxEncodedLength < sizeof(rxEncoded)) {
+            rxEncoded[rxEncodedLength++] = byte;
+        } else {
+            rxEncodedLength = 0;
+        }
+    }
+}
+
+static void enforceSerialWatchdog() {
+    const uint32_t now = millis();
+    if (lastValidCommandMs == 0 || now - lastValidCommandMs > kSerialWatchdogMs) {
+        if (!watchdogTripped) {
+            stopAllMotors();
+        }
+        watchdogTripped = true;
     }
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(kSerialBaud);
 
     encoderMux.begin();
     loadPersistentConfig();
-
     bus.begin();
-
-    c1.setMotorType(true);   // Motor 1: M3508/C620
-    c2.setMotorType(false);  // Motor 2: M2006/C610
-
-    Serial.println("# SYSTEM READY. Type 'h' for help.");
-    Serial.println("# AS5600 mux on Wire1 SDA=6 SCL=7 at 100kHz. Encoder map is loaded from EEPROM.");
+    stopAllMotors();
 }
 
 void loop() {
     bus.update();
     pollOneConfiguredEncoder();
-    checkSerial();
+    processSerialProtocol();
+    enforceSerialWatchdog();
 
     for (uint8_t i = 0; i < kMotorCount; ++i) {
         motors[i]->update();
-    }
-
-    const uint32_t now = millis();
-    if (teleEnabled && (now - lastTeleMs >= kTelemetryIntervalMs)) {
-        printTelemetry(now);
-        lastTeleMs = now;
     }
 
     loopCtrl.update();
